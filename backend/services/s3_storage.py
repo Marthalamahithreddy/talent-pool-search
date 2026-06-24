@@ -1,29 +1,53 @@
 # =============================================================
 # FILE: backend/services/s3_storage.py
-# PURPOSE: Upload resume files to AWS S3 and return a public URL.
+# PURPOSE: Upload resume files to AWS S3 and return a presigned URL.
 #
 # Each resume gets a unique S3 key:  resumes/{resume_id}/{filename}
-# The bucket must have public read access OR a presigned URL is used.
-# This implementation uses presigned URLs (more secure — files are
-# not public by default).
+# Files are private; access is granted via short-lived presigned URLs
+# (more secure — the bucket is never public).
+#
+# IMPORTANT: the client is built with signature_version="s3v4" and
+# virtual-hosted addressing so presigned URLs target the *regional*
+# endpoint (e.g. ...s3.ap-south-1.amazonaws.com). Without this, boto3
+# signs against the global ...s3.amazonaws.com host, S3 issues a region
+# redirect, and the signature no longer matches → SignatureDoesNotMatch.
 #
 # Public API:
-#   upload_resume(resume_id: str, filename: str, file_bytes: bytes) -> str
-#       Returns a presigned S3 URL valid for 7 days.
+#   upload_resume(resume_id, filename, file_bytes) -> str   (upload + presign)
+#   presign_resume_url(resume_id, filename) -> str          (presign only)
 # =============================================================
 
 import os
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+# Presigned URLs are valid for 7 days
+_PRESIGN_EXPIRY_SECONDS = 60 * 60 * 24 * 7
 
 
 def _get_s3_client():
-    """Build and return a boto3 S3 client using env vars."""
+    """Build a boto3 S3 client that presigns against the regional endpoint."""
     return boto3.client(
         "s3",
         aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"},
+        ),
+    )
+
+
+def _s3_key(resume_id: str, filename: str) -> str:
+    """Build the canonical S3 object key for a resume."""
+    return f"resumes/{resume_id}/{filename}"
+
+
+def _content_type(filename: str) -> str:
+    return "application/pdf" if filename.lower().endswith(".pdf") else (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
 
 
@@ -42,24 +66,33 @@ def upload_resume(resume_id: str, filename: str, file_bytes: bytes) -> str:
         ClientError: If the S3 upload or presign fails.
     """
     bucket = os.environ["S3_BUCKET_NAME"]
-    s3_key = f"resumes/{resume_id}/{filename}"
-
-    content_type = "application/pdf" if filename.lower().endswith(".pdf") else (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
+    s3_key = _s3_key(resume_id, filename)
 
     s3 = _get_s3_client()
     s3.put_object(
         Bucket=bucket,
         Key=s3_key,
         Body=file_bytes,
-        ContentType=content_type,
+        ContentType=_content_type(filename),
     )
 
-    # Generate a presigned URL so the file can be downloaded without making the bucket public
-    url = s3.generate_presigned_url(
+    return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": s3_key},
-        ExpiresIn=60 * 60 * 24 * 7,   # 7 days
+        ExpiresIn=_PRESIGN_EXPIRY_SECONDS,
     )
-    return url
+
+
+def presign_resume_url(resume_id: str, filename: str) -> str:
+    """Generate a fresh presigned GET URL for an already-uploaded resume.
+
+    Used when serving a candidate profile so download links are always valid
+    (presigning is a local operation — no network/API call to AWS).
+    """
+    bucket = os.environ["S3_BUCKET_NAME"]
+    s3 = _get_s3_client()
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": _s3_key(resume_id, filename)},
+        ExpiresIn=_PRESIGN_EXPIRY_SECONDS,
+    )

@@ -20,8 +20,21 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from db.database import get_supabase
 from models.schemas import CandidateCard, CandidateDetail, StatsResponse
+from services.s3_storage import presign_resume_url
 
 router = APIRouter()
+
+
+def _contains(value: str) -> str:
+    """Build a case-insensitive 'contains' pattern for PostgREST ilike.
+
+    PostgREST's wildcard is '*', NOT SQL's '%'. Sending a literal '%' (which
+    URL-encodes to '%25') crashes the Supabase edge with a Cloudflare 1101
+    'Worker threw exception'. We strip any '%'/'*' the user typed and wrap the
+    term in '*' so substring search works reliably.
+    """
+    cleaned = value.strip().replace("%", "").replace("*", "")
+    return f"*{cleaned}*"
 
 
 @router.get("/stats", response_model=StatsResponse)
@@ -76,7 +89,7 @@ def suggest_skills(
     query = sb.table("skills").select("name").order("name")
 
     if q.strip():
-        query = query.ilike("name", f"%{q.strip().lower()}%")
+        query = query.ilike("name", _contains(q.lower()))
 
     rows = query.limit(limit).execute().data
     # Title-case for display (skills stored lowercase)
@@ -105,7 +118,7 @@ def list_candidates(
         skill_rows = (
             sb.table("skills")
             .select("id")
-            .ilike("name", f"%{skill_lower}%")
+            .ilike("name", _contains(skill_lower))
             .execute()
             .data
         )
@@ -131,7 +144,7 @@ def list_candidates(
     query = sb.table("candidates").select("id, name, location, years_experience, current_title")
 
     if location:
-        query = query.ilike("location", f"%{location.strip()}%")
+        query = query.ilike("location", _contains(location))
 
     if min_exp is not None:
         query = query.gte("years_experience", min_exp)
@@ -179,17 +192,25 @@ def get_candidate(candidate_id: UUID):
     skills_map = _load_skills_for_candidates(sb, [cid])
     skills = skills_map.get(cid, [])
 
-    # Fetch the S3 URL from the resume row (latest completed one)
+    # Regenerate a fresh presigned download URL from the resume's id + filename.
+    # (Doing it on-demand keeps links valid and works for resumes uploaded
+    #  before the S3 endpoint fix, without needing a re-upload.)
     resume_row = (
         sb.table("resumes")
-        .select("s3_url")
+        .select("id, original_filename, s3_url")
         .eq("candidate_id", cid)
         .eq("processing_status", "completed")
         .limit(1)
         .execute()
         .data
     )
-    s3_url = resume_row[0]["s3_url"] if resume_row else None
+    s3_url = None
+    if resume_row:
+        row = resume_row[0]
+        try:
+            s3_url = presign_resume_url(row["id"], row["original_filename"])
+        except Exception:
+            s3_url = row.get("s3_url")   # fall back to the stored URL if presign fails
 
     return CandidateDetail(
         id=c["id"],

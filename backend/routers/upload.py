@@ -227,30 +227,46 @@ def _process_single_resume(
 
 
 def _upsert_skills(sb, candidate_id: str, skills: list[str]) -> None:
-    """Insert skills into skills table (dedup by name) and link to candidate."""
+    """Bulk-upsert skills and link them to the candidate.
+
+    This used to be an N+1 loop (~3 sequential DB round trips per skill),
+    which dominated upload latency. It is now a fixed 3 calls regardless of
+    skill count:
+        1. bulk upsert every skill name
+        2. one select to resolve their ids
+        3. one bulk upsert of the candidate ↔ skill links
+    """
+    # Normalize + dedup, preserving order
+    names: list[str] = []
+    seen: set[str] = set()
     for skill_name in skills:
         normalized = skill_name.strip().lower()
-        if not normalized:
-            continue
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            names.append(normalized)
+    if not names:
+        return
 
-        # Upsert skill by name
-        result = (
-            sb.table("skills")
-            .upsert({"name": normalized}, on_conflict="name")
-            .execute()
-        )
-        skill_rows = result.data
-        if not skill_rows:
-            # Already exists — fetch it
-            skill_rows = sb.table("skills").select("id").eq("name", normalized).execute().data
+    # 1. Bulk upsert all skill names (existing rows left untouched)
+    sb.table("skills").upsert(
+        [{"name": n} for n in names],
+        on_conflict="name",
+        ignore_duplicates=True,
+    ).execute()
 
-        skill_id = skill_rows[0]["id"]
+    # 2. Resolve ids for every skill in a single query
+    skill_rows = (
+        sb.table("skills").select("id").in_("name", names).execute().data
+    )
+    skill_ids = [r["id"] for r in skill_rows]
+    if not skill_ids:
+        return
 
-        # Link candidate ↔ skill (ignore duplicate)
-        sb.table("candidate_skills").upsert({
-            "candidate_id": candidate_id,
-            "skill_id":     skill_id,
-        }, on_conflict="candidate_id,skill_id").execute()
+    # 3. Bulk link candidate ↔ skills (ignore duplicate pairs)
+    sb.table("candidate_skills").upsert(
+        [{"candidate_id": candidate_id, "skill_id": sid} for sid in skill_ids],
+        on_conflict="candidate_id,skill_id",
+    ).execute()
 
 
 def _mark_resume(sb, resume_id: str, status: str, error: str = None) -> None:

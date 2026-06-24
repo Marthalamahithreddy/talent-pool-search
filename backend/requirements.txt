@@ -20,8 +20,9 @@ python-multipart==0.0.9      # required for FastAPI file uploads
 PyMuPDF>=1.24.5,<2.0          # PDF extraction (fitz) — range covers Python 3.11–3.13 wheels
 python-docx==1.1.2            # DOCX extraction
 
-# AI parsing
-google-generativeai==0.7.2    # Gemini 2.5 Flash
+# AI parsing — provider selected via AI_PROVIDER env var (groq | gemini)
+groq>=1.5,<2.0                # Groq (default) — fast, generous free tier
+google-generativeai==0.7.2    # Gemini (fallback)
 
 # Database – Supabase
 supabase==2.5.1

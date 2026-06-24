@@ -1,0 +1,38 @@
+# =============================================================
+# FILE: backend/requirements.txt
+# PURPOSE: All Python dependencies for the FastAPI backend.
+#
+# Key groups:
+#   Web      → fastapi, uvicorn
+#   Parsing  → pymupdf (PDF), python-docx (DOCX)
+#   AI       → google-generativeai (Gemini 2.5 Flash)
+#   Database → supabase (Supabase Python client)
+#   Storage  → boto3 (AWS S3)
+#   Testing  → pytest, pytest-asyncio, httpx
+# =============================================================
+
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9      # required for FastAPI file uploads
+
+# Resume text extraction
+PyMuPDF>=1.24.5,<2.0          # PDF extraction (fitz) — range covers Python 3.11–3.13 wheels
+python-docx==1.1.2            # DOCX extraction
+
+# AI parsing
+google-generativeai==0.7.2    # Gemini 2.5 Flash
+
+# Database – Supabase
+supabase==2.5.1
+
+# AWS S3 file storage
+boto3==1.34.131
+
+# Config / environment
+python-dotenv==1.0.1
+
+# Testing
+pytest==8.2.2
+pytest-asyncio==0.23.7
+httpx==0.27.0                 # async HTTP client for FastAPI TestClient

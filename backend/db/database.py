@@ -11,6 +11,8 @@
 
 import os
 from functools import lru_cache
+
+import httpx
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -32,4 +34,26 @@ def get_supabase() -> Client:
             "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env"
         )
 
-    return create_client(url, key)
+    client = create_client(url, key)
+    _force_http1(client)
+    return client
+
+
+def _force_http1(client: Client) -> None:
+    """Rebuild the PostgREST httpx session without HTTP/2.
+
+    postgrest-py hard-codes ``http2=True``. Combined with httpcore 1.0.x
+    this intermittently raises:
+        httpx.LocalProtocolError: Received pseudo-header in trailer
+    which surfaces as random 500s on DB reads/writes. HTTP/1.1 is just as
+    fast for our small JSON payloads and avoids the bug entirely.
+    """
+    pg = client.postgrest
+    old = pg.session
+    pg.session = httpx.Client(
+        base_url=old.base_url,
+        headers=old.headers,
+        timeout=old.timeout,
+        follow_redirects=True,
+        http2=False,
+    )

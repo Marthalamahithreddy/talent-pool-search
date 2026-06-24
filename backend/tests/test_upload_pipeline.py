@@ -43,8 +43,10 @@ class _Query:
     def select(self, *_a, **_k):  self._mode = "select"; return self
     def insert(self, payload):    self._mode = "insert"; self._payload = payload; return self
     def update(self, payload):    self._mode = "update"; self._payload = payload; return self
-    def upsert(self, payload, on_conflict=None):
-        self._mode = "upsert"; self._payload = payload; self._on_conflict = on_conflict; return self
+    def upsert(self, payload, on_conflict=None, ignore_duplicates=False, **_k):
+        self._mode = "upsert"; self._payload = payload
+        self._on_conflict = on_conflict; self._ignore_dup = ignore_duplicates
+        return self
     def eq(self, col, val):       self._eq.append((col, val)); return self
     def in_(self, col, vals):     self._in.append((col, list(vals))); return self
     def order(self, *_a, **_k):   return self
@@ -79,17 +81,27 @@ class _Query:
                     updated.append(r)
             return _Result(updated)
         if self._mode == "upsert":
-            # For skills: dedup by 'name'; otherwise just append
-            key = self._on_conflict
-            if key == "name":
-                for r in rows:
-                    if r.get("name") == self._payload.get("name"):
-                        return _Result([r])
-                new = {"id": str(uuid.uuid4()), **self._payload}
+            # Accept both a single dict and a bulk list of dicts.
+            payloads = self._payload if isinstance(self._payload, list) else [self._payload]
+            conflict_keys = (
+                [k.strip() for k in self._on_conflict.split(",")] if self._on_conflict else []
+            )
+            out = []
+            for p in payloads:
+                existing = None
+                if conflict_keys:
+                    for r in rows:
+                        if all(r.get(k) == p.get(k) for k in conflict_keys):
+                            existing = r
+                            break
+                if existing is not None:
+                    out.append(existing)          # leave existing row untouched
+                    continue
+                new = dict(p)
+                new.setdefault("id", str(uuid.uuid4()))
                 rows.append(new)
-                return _Result([new])
-            rows.append(dict(self._payload))
-            return _Result([dict(self._payload)])
+                out.append(new)
+            return _Result(out)
         return _Result([])
 
 

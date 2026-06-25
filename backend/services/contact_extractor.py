@@ -43,6 +43,44 @@ _GITHUB_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Words that signal a line is a SECTION HEADER, JOB TITLE, or STATUS —
+# never a person's name. If any word of a candidate line is in this set,
+# the line is rejected (we'd rather fall back to "Unknown Candidate" than
+# show a section header / title as the candidate's name).
+_NON_NAME_WORDS = frozenset({
+    # ---- résumé section headers / status lines ----
+    "resume", "cv", "curriculum", "vitae", "profile", "summary", "objective",
+    "about", "contact", "details", "education", "experience", "work",
+    "employment", "history", "skills", "skill", "projects", "project",
+    "certifications", "certification", "achievements", "awards", "references",
+    "interests", "hobbies", "languages", "publications", "career", "break",
+    "personal", "professional", "technical", "portfolio", "declaration",
+    "applicant", "information", "candidate", "details", "overview", "bio",
+    "biography", "background", "introduction", "snapshot", "highlights",
+    # ---- job-title / role words ----
+    "engineer", "engineering", "developer", "development", "manager",
+    "management", "designer", "design", "executive", "intern", "internship",
+    "analyst", "lead", "architect", "consultant", "specialist", "officer",
+    "director", "scientist", "administrator", "coordinator", "representative",
+    "associate", "assistant", "founder", "head", "president", "vice",
+    "freelance", "freelancer", "student", "graduate", "trainee", "fresher",
+    "fullstack", "stack", "frontend", "backend", "senior", "junior",
+    "sr", "jr", "devops", "qa", "sde", "swe", "regional", "sales", "marketing",
+    "operations", "finance", "product", "data", "software", "hardware",
+    "support", "service", "services", "solutions", "team", "staff",
+})
+
+# Common locations that can masquerade as a 2-word name (e.g. "New York").
+# Lowercased single tokens; if a line is made ONLY of these (+ geo words),
+# it is treated as a location, not a name.
+_LOCATION_WORDS = frozenset({
+    "new", "york", "san", "francisco", "los", "angeles", "bay", "area",
+    "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "chennai",
+    "pune", "kolkata", "ahmedabad", "jaipur", "noida", "gurugram", "gurgaon",
+    "kochi", "vijayawada", "manipal", "india", "usa", "uk", "london",
+    "city", "town", "state", "remote", "hybrid", "onsite",
+})
+
 
 def extract_contacts(raw_text: str) -> dict:
     """Extract contact fields from raw resume text via regex.
@@ -74,25 +112,49 @@ def _extract_name(text: str) -> Optional[str]:
     """Heuristic: the candidate's name is usually in the first few lines.
 
     Strategy:
-      1. Take the first 5 non-empty lines.
-      2. Skip lines that look like contact info (contain @ or phone digits).
-      3. Return the first remaining line that looks like a name (2–4 words,
-         only letters/spaces/hyphens, no special chars).
+      1. Scan the first 6 non-empty lines.
+      2. Skip contact lines (@ / linkedin / github / long digit runs).
+      3. Skip lines that contain a comma (locations like "Mumbai, India").
+      4. Accept a line of 2–4 letter-only words ONLY if it looks like a
+         real name — i.e. it contains no section-header / job-title word
+         and is not purely a location ("New York").
 
-    Falls back to None if nothing matches — the AI will fill it in.
+    Returns None when nothing qualifies, so the UI shows "Unknown Candidate"
+    rather than a section header, title, or location masquerading as a name.
     """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:8]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()][:6]
 
     for line in lines:
+        low = line.lower()
         # Skip lines with obvious contact markers
-        if "@" in line or "linkedin" in line.lower() or "github" in line.lower():
+        if "@" in line or "linkedin" in low or "github" in low or "http" in low:
             continue
-        if re.search(r"\d{5,}", line):   # long digit run = phone / zip
+        if re.search(r"\d", line):       # any digit = phone / zip / address
+            continue
+        if "," in line or "|" in line:   # locations / contact separators
             continue
 
         words = line.split()
-        if 2 <= len(words) <= 5 and all(re.match(r"[A-Za-z\-\.']+$", w) for w in words):
-            return line
+
+        # The name is ALWAYS above the first real section/title line. Once we
+        # reach one, stop — anything below (skills, body text) is not the name.
+        if 1 <= len(words) <= 3 and {w.strip(".'-").lower() for w in words} <= _NON_NAME_WORDS:
+            break
+
+        if not (2 <= len(words) <= 4):
+            continue
+        if not all(re.match(r"^[A-Za-z][A-Za-z\-\.']*$", w) for w in words):
+            continue
+
+        word_set = {w.strip(".'-").lower() for w in words}
+        # Reject section headers / job titles ("Sales Executive", "Work Experience")
+        if word_set & _NON_NAME_WORDS:
+            continue
+        # Reject lines made entirely of location tokens ("New York")
+        if word_set <= _LOCATION_WORDS:
+            continue
+
+        return line
 
     return None
 

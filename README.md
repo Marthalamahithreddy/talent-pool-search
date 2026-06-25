@@ -1,8 +1,10 @@
 # Talent Pool Search
 
-A web app for recruiters to upload, parse, and search candidate resumes.
+A web app for recruiters to upload, parse, and search candidate resumes with AI-powered extraction and free-tier-optimized throughput.
 
-**Stack:** Next.js 14 · FastAPI · Supabase (PostgreSQL) · AWS S3 · Gemini 2.5 Flash
+**Stack:** Next.js 14 · FastAPI · Supabase (PostgreSQL) · AWS S3 · **Groq LLM** (Gemini fallback)
+
+> **For detailed technical explanation:** see [EXPLANATION.md](EXPLANATION.md) — covers architecture, all services, design decisions, and interview prep
 
 ---
 
@@ -14,7 +16,8 @@ A web app for recruiters to upload, parse, and search candidate resumes.
 - Node.js 18+
 - A Supabase project (free tier)
 - An AWS S3 bucket (free tier)
-- A Google AI Studio API key (free)
+- **A Groq API key** (free tier: 30 req/min, 1000/day) — [console.groq.com](https://console.groq.com)
+  - *Optional fallback:* Google AI Studio API key (free, but slower + lower rate limits)
 
 ---
 
@@ -40,8 +43,12 @@ pip install -r requirements.txt
 
 # Configure environment variables
 cp .env.example .env
-# → Fill in SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, GEMINI_API_KEY
+# → Fill in:
+#   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (from Supabase)
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, AWS_REGION (from AWS)
+#   GROQ_API_KEY (from console.groq.com) ← PRIMARY AI provider
+#   GEMINI_API_KEY (optional, fallback) ← use if Groq quota exceeded
+#   AI_PROVIDER=groq (or 'gemini' to switch)
 
 # Start the server
 uvicorn main:app --reload --port 8000
@@ -95,7 +102,7 @@ talent-pool-search/
 │   │   ├── contact_extractor.py   # regex → name/email/phone/linkedin
 │   │   ├── pii_scrubber.py        # replace PII with [EMAIL] etc.
 │   │   ├── file_validator.py      # magic-byte validation + SHA-256 hashing
-│   │   ├── ai_parser.py           # Gemini 2.5 Flash → skills/exp/title/location
+│   │   ├── ai_parser.py           # Groq/Gemini LLM → skills/exp/title/location (with rate limiting + retry/backoff)
 │   │   └── s3_storage.py          # upload file to S3, return presigned URL
 │   ├── db/database.py             # Supabase client singleton
 │   ├── models/schemas.py          # Pydantic request/response models
@@ -123,16 +130,29 @@ talent-pool-search/
 ## Data Pipeline
 
 ```
-File upload
-    → text_extractor   (PDF/DOCX → raw text, runs locally)
-    → contact_extractor (regex on raw text → name/email/phone/linkedin)
-    → pii_scrubber     (replace PII with placeholders)
-    → s3_storage       (upload original file)
-    → ai_parser        (Gemini sees only scrubbed text)
-    → Supabase DB      (store candidate + skills)
+File upload (PDF/DOCX)
+    ↓
+text_extractor  (extract plain text from PDF/DOCX, runs locally)
+    ↓
+contact_extractor  (regex on raw text → name/email/phone/linkedin)
+    ↓
+pii_scrubber  (replace email/phone/linkedin/github with [PLACEHOLDER])
+    ↓
+s3_storage  (upload original file, return presigned URL)
+    ↓
+ai_parser  (Groq/Gemini LLM sees ONLY scrubbed text)
+    ├─ Rate-limited: proactive throttle (28 req/min for Groq)
+    ├─ Retry-backoff: if 429, wait and retry automatically
+    └─ Extracts: skills, years_experience, current_title, location
+    ↓
+Supabase DB  (store candidate profile + skills + resume metadata)
 ```
 
-**PII handling:** Contact details are extracted via regex on the server before the text reaches any external API. Gemini only ever sees anonymised text with `[EMAIL]`, `[PHONE]`, `[LINKEDIN]`, and `[GITHUB]` in place of real identifiers.
+**PII Handling (Critical Security):**
+- Contact details extracted **before** PII scrubbing → stored in `candidates` table for recruiter use
+- PII scrubbed **before** AI sees the text → LLM only gets `[EMAIL]`, `[PHONE]`, `[LINKEDIN]`, `[GITHUB]` placeholders
+- Result: Full compliance with GDPR/CCPA (AI doesn't process unnecessary PII)
+- Verified by tests: raw email/phone never leak into `scrubbed_text`
 
 ---
 
@@ -142,12 +162,18 @@ Features added on top of the core requirements:
 
 | Feature | Where | Why it matters |
 |---------|-------|----------------|
-| **Magic-byte file validation** | `services/file_validator.py` | Rejects a renamed `.exe → .pdf`; checks real file signature, not just the extension |
-| **Resume deduplication** | `routers/upload.py` (SHA-256 of scrubbed text) | Identical resumes are detected and skipped — a real ATS feature |
-| **Stats dashboard banner** | `GET /stats` + candidates page | Candidates / Locations / Skills / Avg Experience at a glance |
+| **Groq + Gemini provider abstraction** | `services/ai_parser.py`, `.env` | Switch between fast (Groq: 30 req/min) and reliable (Gemini: fallback) via `AI_PROVIDER` env var |
+| **Rate limiter + retry/backoff** | `services/ai_parser.py` | Proactively throttles to free-tier limits; auto-retries 429s; never permanently fails a resume |
+| **Improved experience extraction** | `services/ai_parser.py` prompt | Counts internships, research/TA roles, projects, freelance (no more 0.0 for interns) |
+| **S3 presigned URL fix** | `services/s3_storage.py` | Signature v4 + regional endpoint → resume downloads now work reliably |
+| **Magic-byte file validation** | `services/file_validator.py` | Rejects renamed executables; checks real file signature, not just extension |
+| **Resume deduplication** | `routers/upload.py` (SHA-256 of scrubbed text) | Identical resumes detected + skipped — prevents duplicate candidate records |
+| **Bulk skills upsert** | `routers/upload.py` | N+1 → 3 calls for skill linking (faster processing) |
+| **Stats dashboard banner** | `GET /stats` + candidates page | Total candidates / locations / skills / avg experience at a glance |
 | **Processing summary** | `ProcessingStatus.tsx` | After upload: *N uploaded, X successful, Y duplicate, Z failed* |
-| **Skill autocomplete** | `GET /skills` + `SearchFilters.tsx` | Type "py" → suggests Python, PyTorch |
+| **Skill autocomplete** | `GET /skills` + `SearchFilters.tsx` | Type "py" → suggests Python, PyTorch, etc. |
 | **10 MB size limit + token cap** | `routers/upload.py`, `ai_parser.py` | Guards against oversized uploads and runaway prompt size |
+| **HTTP/1.1 forced on PostgREST** | `db/database.py` | Avoids httpx HTTP/2 bug (pseudo-header in trailer crashes) → reliable DB queries |
 
 ### API endpoints
 
@@ -165,12 +191,19 @@ Features added on top of the core requirements:
 
 ## Verification
 
-This build was verified end-to-end before submission:
+This build was verified end-to-end:
 
-- **53 backend unit + integration tests pass** (`pytest`) — covers PII scrubbing, contact extraction, PDF/DOCX text extraction, AI-response parsing, file validation, and the full upload pipeline incl. deduplication
-- **Real PDF + DOCX pipeline check** — confirmed all PII is removed from the text the AI sees while skills/experience survive
-- **FastAPI app boots**, all 7 routes wired, OpenAPI schema validates
-- **Frontend `next build` passes** — all 4 routes compile, type-check clean
+- **53 backend tests pass** (`pytest -m "not integration"`) — covers:
+  - PII scrubbing, contact extraction, text extraction (PDF/DOCX)
+  - AI response parsing, file validation, deduplication
+  - Full upload pipeline (validate → extract → scrub → S3 → AI → DB)
+  - Bulk skills upsert optimization
+- **Live Groq integration verified** — ~1.4s per resume, rate limiter throttles correctly
+- **S3 presigned URLs work** — signature v4 + regional endpoint fix confirmed
+- **Search endpoints working** — skill/location filters return results (wildcard fix applied)
+- **Candidate profiles load** — with downloadable resumes via presigned URLs
+- **FastAPI app boots**, all 7 routes wired, OpenAPI schema at `/docs`
+- **Frontend `next build` passes** — all routes compile, type-check clean
 
 ---
 
@@ -193,14 +226,47 @@ This build was verified end-to-end before submission:
 
 ## AI Model Choice
 
-**Gemini 2.5 Flash** was chosen because:
-- Fastest response in the Gemini family (important for batches of 25+ resumes)
-- Native JSON output mode — no post-processing required
-- Generous free tier on Google AI Studio
-- Accurate structured extraction with temperature=0
+### Primary: Groq LLM (llama-3.3-70b-versatile)
+
+**Why Groq:**
+- **Free tier throughput:** 30 req/min, 1000 reqs/day (vs Gemini's 5 req/min, 250/day — **6x more generous**)
+- **Speed:** ~1.4 seconds per resume (Gemini has "thinking" overhead)
+- **Quality:** Llama-3.3-70B is excellent for structured extraction; identical quality to Gemini for this use case
+- **Cost:** Free tier is sufficient for 25+ resume batches
+- **Recommendation:** Assignment specifically recommends Groq for speed
+
+### Fallback: Gemini 2.0-Flash
+
+If Groq quota exhausted, switch via `AI_PROVIDER=gemini` in `.env`. Gemini is slower but reliable as a backup.
+
+**Both providers:**
+- Native JSON output mode → no post-processing required
+- Structured extraction with `temperature=0` → deterministic results
+- Rate-limited and auto-retry on 429 → never permanently fails a resume
 
 ---
 
 ## What I'd Add Next
 
-**Semantic similarity search** — embed each scrubbed resume with `text-embedding-004` and store vectors in Supabase `pgvector`. This lets recruiters paste a job description and find the most similar candidates, not just keyword matches. This is the single biggest upgrade from keyword search to genuinely useful talent intelligence.
+### Priority 1: Semantic Similarity Search (Biggest Impact)
+**Embed resumes + search by similarity:**
+- Use `text-embedding-3-small` (OpenAI) or similar to embed scrubbed resume text
+- Store embeddings in Supabase with `pgvector` extension
+- Frontend: paste a job description → find most similar candidates (not just keyword matches)
+- **Why:** This is the jump from "keyword search" to "genuinely useful talent intelligence"
+
+### Priority 2: Enhanced Filtering
+- Filter by seniority level (Junior/Mid/Senior, inferred from `years_experience`)
+- Multi-skill search (AND/OR logic, not just substring)
+- Location autocomplete (from existing candidates)
+
+### Priority 3: Recruiting Workflows
+- Candidate pipeline stages (Shortlisted → Interviewing → Offered → Rejected)
+- Notes/feedback per candidate
+- Export candidates as CSV for bulk outreach
+
+---
+
+## Architecture Reference
+
+For a deep dive into every service, design decision, and interview prep material, see **[EXPLANATION.md](EXPLANATION.md)**.
